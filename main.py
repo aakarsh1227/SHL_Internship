@@ -43,67 +43,73 @@ def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
+    # 1. Enforce the 8-turn limit
+    if len(request.messages) > 8:
+        return ChatResponse(
+            reply="Conversation limit reached. How else can I help?",
+            recommendations=[],
+            end_of_conversation=True
+        )
+
+    # 2. Extract keywords from the user's latest message to filter the catalog
+    user_query = request.messages[-1].content.lower()
+    
+    # Filter catalog: Only include items where the name or description matches a keyword
+    # This reduces the prompt size from 100 items to ~5-10 items
+    relevant_catalog = [
+        item for item in CATALOG 
+        if any(word in item["name"].lower() or word in item["description"].lower() 
+               for word in user_query.split())
+    ]
+    
+    # Fallback: If no keywords match, send a small default sample so the AI isn't blind
+    if not relevant_catalog:
+        relevant_catalog = CATALOG[:10]
+
+    # 3. Build a Lean System Prompt
+    system_prompt = (
+        "You are an SHL Product Expert. Based on the user query, suggest 1-3 products "
+        "ONLY from this relevant list. Return a friendly reply and a valid JSON list "
+        "of recommendations.\n\nRelevant Catalog:\n" + str(relevant_catalog)[:4000] # Cap length
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in request.messages:
+        messages.append({"role": msg.role, "content": msg.content})
+
     try:
-        turn_count = len(request.messages)
-        is_last_turn = turn_count >= 7 
-
-        # 2. Clean System Instruction
-        system_instruction = f"""You are an SHL Product Expert. 
-CATALOG: {json.dumps(CATALOG)}
-
-RULES:
-1. If query is vague, ask for role/seniority.
-2. Recommend only from the catalog provided.
-3. Use exact names and URLs.
-4. Output MUST be ONLY valid JSON. No conversational filler.
-"""
-        if is_last_turn:
-            system_instruction += "\nCRITICAL: Final turn. Provide recommendations now."
-
-        # 3. Build History
-        # Build History using Mistral-specific tags
-        user_history = ""
-        for msg in request.messages:
-            if msg.role == "user":
-                user_history += f" [INST] {msg.content} [/INST] "
-            else:
-                user_history += f" {msg.content} "
-            
-        full_prompt = f"<s>[INST] {system_instruction} [/INST] {user_history} assistant:"
-
-        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-        
-        async with AsyncClient(timeout=60.0) as client: 
+        async with httpx.AsyncClient() as client:
             response = await client.post(
                 HF_API_URL,
-                headers=headers,
-                json={
-                    "inputs": full_prompt,
-                    "parameters": {"max_new_tokens": 500, "temperature": 0.1, "return_full_text": False},
-                    "options": {"wait_for_model": True}
-                }
+                headers={"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"},
+                json={"inputs": str(messages), "parameters": {"max_new_tokens": 500}},
+                timeout=20.0
             )
 
-            if response.status_code != 200:
-                return {"reply": "AI service is warming up. Try again in 5s.", "recommendations": [], "end_of_conversation": False}
+        if response.status_code == 503:
+            return ChatResponse(reply="AI service is warming up. Try again in 5s.", recommendations=[], end_of_conversation=False)
 
-            result = response.json()
-            gen_text = result[0]['generated_text'] if isinstance(result, list) else str(result)
-
-            # 4. Safer Regex extraction
-            match = re.search(r'\{.*\}', gen_text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                has_recs = len(data.get("recommendations", [])) > 0
-                return {
-                    "reply": data.get("reply", "Here are your recommendations."),
-                    "recommendations": data.get("recommendations", []),
-                    "end_of_conversation": True if (is_last_turn or has_recs) else data.get("end_of_conversation", False)
-                }
+        # Parse AI response
+        raw_text = response.json()[0]['generated_text']
+        
+        # Simple extraction of reply and recommendations (ensure your parsing logic is robust here)
+        # For the sake of this fix, we assume the AI returns valid JSON as requested
+        import json
+        import re
+        
+        # Look for JSON array in the output
+        match = re.search(r'\[\s*{.*}\s*\]', raw_text, re.DOTALL)
+        recommendations = []
+        if match:
+            recommendations = json.loads(match.group())
             
-            return {"reply": "I couldn't generate a proper response. Please refine your request.", "recommendations": [], "end_of_conversation": is_last_turn}
+        reply = raw_text.split("[")[0].strip() if "[" in raw_text else raw_text
+
+        return ChatResponse(
+            reply=reply,
+            recommendations=recommendations[:3],
+            end_of_conversation=len(recommendations) > 0
+        )
 
     except Exception as e:
-        # Check your terminal for this print output to see the REAL error
-        print(f"DEBUG ERROR: {str(e)}")
-        return {"reply": "Internal processing error.", "recommendations": [], "end_of_conversation": False}
+        return ChatResponse(reply=f"Error: {str(e)}", recommendations=[], end_of_conversation=False)
