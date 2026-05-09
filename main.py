@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from catalog import CATALOG
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from httpx import AsyncClient
