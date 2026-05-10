@@ -4,18 +4,34 @@ import os
 import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
 from dotenv import load_dotenv
-
-# Import your custom data and models
-from catalog import CATALOG
-from models import ChatRequest, ChatResponse
 
 # Load environment variables
 load_dotenv()
 
+# --- SCHEMAS ---
+class Message(BaseModel):
+    role: str
+    content: str
+
+class Recommendation(BaseModel):
+    name: str
+    url: str
+    test_type: str
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+
+class ChatResponse(BaseModel):
+    reply: str
+    recommendations: List[Recommendation]
+    end_of_conversation: bool
+
+# --- APP SETUP ---
 app = FastAPI()
 
-# Enable CORS for frontend interaction
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,9 +40,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# FIXED: Ensure variable name matches usage in the function
+# --- CONFIG ---
+# Use the generic Inference API URL which automatically routes to the best available instance
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HF_API_URL = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+
+# --- DATA ---
+# (Using a sample here - keep your full catalog.py if it's working, 
+# but if catalog.py had errors, paste the JSON list here instead)
+try:
+    from catalog import CATALOG
+except ImportError:
+    CATALOG = [
+        {"name": "OPQ32r", "link": "https://www.shl.com/products/product-catalog/view/occupational-personality-questionnaire-opq32r/", "description": "Personality test for managers", "keys": ["Personality"]}
+    ]
 
 @app.get("/health")
 def health():
@@ -34,94 +61,67 @@ def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    # 1. Enforce the 8-turn limit
-    if len(request.messages) > 8:
-        return ChatResponse(
-            reply="Conversation limit reached. How else can I help?",
-            recommendations=[],
-            end_of_conversation=True
-        )
+    if not request.messages:
+        return ChatResponse(reply="How can I help?", recommendations=[], end_of_conversation=False)
 
-    # 2. Extract keywords to filter the large catalog
     user_query = request.messages[-1].content.lower()
     
-    # Keyword filtering prevents prompt overflow and 503 errors
-    relevant_catalog = [
+    # Filter catalog
+    relevant = [
         item for item in CATALOG 
-        if any(word in item["name"].lower() or word in item.get("description", "").lower() 
+        if any(word in item.get("name", "").lower() or word in item.get("description", "").lower() 
                for word in user_query.split())
     ]
     
-    # Fallback to avoid empty context
-    if not relevant_catalog:
-        relevant_catalog = CATALOG[:10]
+    context_data = relevant[:5] if relevant else CATALOG[:5]
 
-    # 3. Build Lean System Prompt
     system_prompt = (
-        "You are an SHL Product Expert. Based on the user query, suggest 1-3 products "
-        "ONLY from this relevant list. Return a friendly reply and a valid JSON list "
-        "of recommendations.\n\nRelevant Catalog:\n" + str(relevant_catalog)[:4000]
+        "You are an SHL Assistant. Suggest 1-3 relevant products from the list below. "
+        "Return a JSON array of objects with keys 'name', 'url', and 'test_type'.\n\n"
+        f"Catalog: {json.dumps(context_data)}"
     )
 
-    formatted_messages = [{"role": "system", "content": system_prompt}]
+    formatted_msgs = [{"role": "system", "content": system_prompt}]
     for msg in request.messages:
-        formatted_messages.append({"role": msg.role, "content": msg.content})
+        formatted_msgs.append({"role": msg.role, "content": msg.content})
 
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 HF_API_URL,
                 headers={"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"},
-                json={
-                    "inputs": f"System: {system_prompt}\nUser: {user_query}", 
-                    "parameters": {"max_new_tokens": 500, "return_full_text": False}
-                },
-                timeout=40.0
+                json={"inputs": str(formatted_msgs), "parameters": {"max_new_tokens": 500}},
+                timeout=30.0
             )
 
-        # 1. Handle Model Loading (503)
         if response.status_code == 503:
-            return ChatResponse(
-                reply="The SHL Product Expert is preparing the catalog. Please retry in 10 seconds.", 
-                recommendations=[], 
-                end_of_conversation=False
-            )
+            return ChatResponse(reply="AI is warming up. Retry in 5s.", recommendations=[], end_of_conversation=False)
 
-        # 2. Handle Non-200 Errors
-        if response.status_code != 200:
-            return ChatResponse(
-                reply=f"AI Service Error ({response.status_code}). Please try again.",
-                recommendations=[],
-                end_of_conversation=False
-            )
-
-        # 3. Safe JSON Parsing
         res_data = response.json()
-        if not res_data or not isinstance(res_data, list):
-            raise ValueError("Unexpected response format from AI")
+        # Handle different HF response formats
+        ai_text = res_data[0].get('generated_text', '') if isinstance(res_data, list) else str(res_data)
 
-        ai_output = res_data[0].get('generated_text', '')
-        
-        # ... (rest of your parsing logic for regex/JSON) ...
-        
-        # Extract JSON list using regex
-        match = re.search(r'\[\s*{.*}\s*\]', ai_output, re.DOTALL)
-        recommendations = []
+        # Regex to find the JSON block
+        match = re.search(r'\[\s*{.*}\s*\]', ai_text, re.DOTALL)
+        recs = []
         if match:
             try:
-                recommendations = json.loads(match.group())
+                # Clean the match for any trailing chars
+                clean_json = match.group().replace("'", '"')
+                recs = json.loads(clean_json)
             except:
-                recommendations = []
-            
-        reply = ai_output.split("[")[0].strip() if "[" in ai_output else ai_output
-        # Clean up any leftover prompt tags from Mistral
-        reply = reply.replace("<s>", "").replace("[INST]", "").strip()
+                recs = []
+
+        clean_reply = ai_text.split("[")[0].replace("<s>", "").replace("[INST]", "").strip()
 
         return ChatResponse(
-            reply=reply,
-            recommendations=recommendations[:3],
-            end_of_conversation=len(recommendations) > 0
+            reply=clean_reply if clean_reply else "Here are my recommendations:",
+            recommendations=[
+                Recommendation(name=r.get("name", "Test"), url=r.get("url", "#"), test_type=r.get("test_type", "General"))
+                for r in recs
+            ][:3],
+            end_of_conversation=len(recs) > 0
         )
 
     except Exception as e:
-        return ChatResponse(reply=f"Error: {str(e)}", recommendations=[], end_of_conversation=False)
+        return ChatResponse(reply=f"Service busy. Please try again.", recommendations=[], end_of_conversation=False)
