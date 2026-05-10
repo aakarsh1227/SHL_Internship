@@ -1,7 +1,10 @@
 import json
+import httpx
 import os
 import re
 from catalog import CATALOG
+from pydantic import BaseModel
+from typing import List, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from httpx import AsyncClient
