@@ -26,7 +26,7 @@ app.add_middleware(
 
 # FIXED: Ensure variable name matches usage in the function
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+HF_API_URL = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
 
 @app.get("/health")
 def health():
@@ -72,19 +72,37 @@ async def chat(request: ChatRequest):
             response = await client.post(
                 HF_API_URL,
                 headers={"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"},
-                json={"inputs": str(formatted_messages), "parameters": {"max_new_tokens": 500}},
-                timeout=30.0
+                json={
+                    "inputs": f"System: {system_prompt}\nUser: {user_query}", 
+                    "parameters": {"max_new_tokens": 500, "return_full_text": False}
+                },
+                timeout=40.0
             )
 
+        # 1. Handle Model Loading (503)
         if response.status_code == 503:
             return ChatResponse(
-                reply="AI service is warming up. Try again in 5s.", 
+                reply="The SHL Product Expert is preparing the catalog. Please retry in 10 seconds.", 
                 recommendations=[], 
                 end_of_conversation=False
             )
 
-        # 4. Robust Response Parsing
-        ai_output = response.json()[0]['generated_text']
+        # 2. Handle Non-200 Errors
+        if response.status_code != 200:
+            return ChatResponse(
+                reply=f"AI Service Error ({response.status_code}). Please try again.",
+                recommendations=[],
+                end_of_conversation=False
+            )
+
+        # 3. Safe JSON Parsing
+        res_data = response.json()
+        if not res_data or not isinstance(res_data, list):
+            raise ValueError("Unexpected response format from AI")
+
+        ai_output = res_data[0].get('generated_text', '')
+        
+        # ... (rest of your parsing logic for regex/JSON) ...
         
         # Extract JSON list using regex
         match = re.search(r'\[\s*{.*}\s*\]', ai_output, re.DOTALL)
